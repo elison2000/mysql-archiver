@@ -75,10 +75,14 @@ def run_command_realtime(command):
 class mysql:
     "mysql接口"
 
-    def __init__(self, conf, mode='list'):
+    def __init__(self, config, mode='dict'):
+        conf = config.copy()
+        conf['connect_timeout'] = 10
+        assert mode in ['dict', 'list'], "无效的mode参数"
         if mode == 'dict':
-            conf['connect_timeout'] = 2
             conf['cursorclass'] = pymysql.cursors.DictCursor
+
+        # 创建连接
         self.conn = pymysql.connect(**conf)
 
     def query(self, sql):
@@ -128,6 +132,9 @@ class mysql:
 
 # main
 if __name__ == "__main__":
-    cmd = 'ls -l'
-    res = run_command(cmd)
+    mode = 'dict'
+    CONFIG_DB = {'host': '10.177.13.210', 'port': 3306, 'db': 'dba_tools', 'user': 'dba_tools',
+                 'password': 'abc123'}
+    conn = mysql(CONFIG_DB, mode)
+    res = conn.query('select now()')
     print(res)

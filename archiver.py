@@ -13,6 +13,7 @@
 #      v1.1        2022-05-30      增加archive-slow、archive-to-file、delete模式
 #      v1.2        2022-06-18      增加waiting状态，解决重复执行的bug
 #      v1.3        2022-06-20      增加TODAY表达式
+#      v1.3.1      2022-07-03      修复class mysql bug
 ####################################################################################################
 """
 
@@ -66,9 +67,9 @@ def exit_handler(signum, frame):
     logging.info('收到停止信号，程序准备退出')
 
 
-def get_configdb_conn(mode='dict'):
+def get_configdb_conn():
     "创建配置库连接"
-    conn = util.mysql(settings.CONFIG_DB, mode=mode)
+    conn = util.mysql(settings.CONFIG_DB)
     return conn
 
 
@@ -89,7 +90,7 @@ def get_archive_tasks(conn):
 def get_failed_tasks():
     "获取当天运行失败的作业"
     sql = "select id,exec_status from archive_tasks where sys_utime>={{TODAY}} and exec_status<>'done & ok'"
-    conn = get_configdb_conn(mode='list')
+    conn = get_configdb_conn()
     res = conn.query(expr_to_date(sql))
     conn.close()
     return res
@@ -98,12 +99,13 @@ def get_failed_tasks():
 def send_exec_result():
     "发送执行结果"
     rows = []
+    res = None
     try:
         res = get_failed_tasks()
         if len(res) > 0:
             title = '有{}个归档任务执行失败'.format(len(res))
             for i in res:
-                row = "task_id: {} , exec_status: {}".format(i[0], i[1])
+                row = "task_id: {} , exec_status: {}".format(i['id'], i['exec_status'])
                 rows.append(row)
             text = "\n".join(rows)
         else:
@@ -242,14 +244,14 @@ class ArchiveTask:
 
     def log_task_begin(self):
         "记录任务开始"
-        conn = get_configdb_conn(mode='list')
+        conn = get_configdb_conn()
         sql = "update archive_tasks set exec_status='running',exec_start=now() where id={0}".format(self.id)
         conn.execute(sql)
         conn.close()
 
     def log_task_status(self):
         "记录任务状态"
-        conn = get_configdb_conn(mode='list')
+        conn = get_configdb_conn()
         sql = "update archive_tasks set exec_status='{1}',exec_seconds={2},exec_end=now() where id={0}".format(
             self.id, self.exec_status, self.exec_seconds)
         conn.execute(sql)
@@ -257,7 +259,7 @@ class ArchiveTask:
 
     def update_task_log(self):
         "更新任务日志"
-        conn = get_configdb_conn(mode='list')
+        conn = get_configdb_conn()
         sql = "update archive_tasks set exec_log='{1}' where id={0}".format(self.id, self.exec_log.replace("'", '"'))
         conn.execute(sql)
         conn.close()
@@ -290,8 +292,8 @@ class ArchiveTask:
             try:
                 source_tb_fields = self.get_table_fields(source_conf, self.source_table)
                 dest_tb_fields = self.get_table_fields(dest_conf, self.dest_table)
-                source_fieldnames = [i[0] for i in source_tb_fields]
-                dest_fieldnames = [i[0] for i in dest_tb_fields]
+                source_fieldnames = [i['Field'] for i in source_tb_fields]
+                dest_fieldnames = [i['Field'] for i in dest_tb_fields]
                 field_not_exist_in_dest = [i for i in source_fieldnames if i not in dest_fieldnames]
                 if field_not_exist_in_dest:
                     self.exec_status = "check failed"
@@ -306,6 +308,7 @@ class ArchiveTask:
             except Exception as e:
                 self.exec_status = "check failed"
                 self.exec_log = str(e)
+                logging.error(self, exc_info=True)
         else:
             retcode = 1
         return retcode
@@ -340,8 +343,9 @@ class ArchiveTask:
 
 def generate_tasks():
     "生成归档任务"
+    conf_list = None
     try:
-        conn = get_configdb_conn(mode='dict')
+        conn = get_configdb_conn()
         conf_list = get_archive_config(conn)
         for conf in conf_list:
             o = ArchiveConfig(conf)
@@ -373,6 +377,7 @@ def produce_job():
     "生产作业"
     global JOB_QUEUE
     global PRODUCER_FINISH
+    task_list = []
     while True:
         # 6秒检测一次
         for i in range(10):
@@ -380,7 +385,7 @@ def produce_job():
             if PRODUCER_FINISH:
                 return 1
         try:
-            conn = get_configdb_conn(mode='dict')
+            conn = get_configdb_conn()
             task_list = get_archive_tasks(conn)
             # 过滤在执行时间窗口的
             to_exec_task_list = [i for i in task_list if is_during_time_window(i['exec_time_window'])]
@@ -392,20 +397,21 @@ def produce_job():
                 JOB_QUEUE.put(obj)
             conn.close()
         except Exception:
-            logging.error(obj, exc_info=True)
+            logging.error(task_list, exc_info=True)
 
 
 def consume_job():
     "消费作业"
     global STOP_TOKEN
     global JOB_QUEUE
+    obj = None
     while True:
         try:
             obj = JOB_QUEUE.get()  # 取实例信息
             if obj == STOP_TOKEN:
                 break
             obj.start()
-        except Exception as e:
+        except Exception:
             logging.error(obj, exc_info=True)
 
 
