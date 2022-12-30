@@ -73,6 +73,10 @@ archive-slow：归档速度慢，兼容性高
 delete：只删除不归档
 archive-to-file：归档到文件
 archive：默认方式，采用--bulk-insert --bulk-delete的方式归档，速度快
+archive-slow-replace:重复行替换模式
+archive-partition：分区表归档
+archive-partition-slow：分区表归档慢模式
+archive-no-ascend：禁用FORCE INDEX(`PRIMARY`)，不按主键顺序扫描，where列有索引时，速度快
 ```
 
 
