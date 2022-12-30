@@ -7,12 +7,14 @@
 ```
 admin.sh        --启动、关闭脚本
 archiver.py     --主程序
+add_task.py     --添加归档任务（在归档实例自动创建库和表）
 init.sql        --建表
 settings.py     --配置文件
 debug.py        --测试
 util.py         --公共函数
 logs            --任务运行的实时日志（行缓冲），任务执行结束，才会把日志保存到表中
 archive_data    --当归档模式为archive-to-file时，归档数据存放到该目录
+archive_partition_table.py  --分区表归档模式
 ```
 
 
