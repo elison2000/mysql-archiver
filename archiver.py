@@ -14,10 +14,15 @@
 #      v1.2        2022-06-18      增加waiting状态，解决重复执行的bug
 #      v1.3        2022-06-20      增加TODAY表达式
 #      v1.3.1      2022-07-03      修复class mysql bug
+#      v1.3.2      2022-08-29      修复is_during_time_window函数 bug
+#      v1.3.3      2022-09-13      增加连接configdb重试机制：失败时重试3次
+#      v1.3.4      2022-10-27      支持设置归档时间间隔功能
+#      v1.3.5      2022-12-02      增加archive-slow-replace、archive-partition、archive-partition-slow模式
+#      v1.3.6      2022-12-30      增加archive-no-ascend模式
 ####################################################################################################
 """
 
-import os
+import os, sys
 import time, datetime
 import re
 import logging
@@ -56,7 +61,8 @@ def set_log_level(level='info'):
         lv = logging.DEBUG
     else:
         lv = logging.INFO
-    logging.basicConfig(level=lv, format='[%(asctime)s.%(msecs)d] [%(levelname)s] %(funcName)s: %(message)s',
+    logging.basicConfig(stream=sys.stdout, level=lv,
+                        format='[%(asctime)s.%(msecs)d] [%(levelname)s] %(funcName)s: %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
 
 
@@ -69,8 +75,13 @@ def exit_handler(signum, frame):
 
 def get_configdb_conn():
     "创建配置库连接"
-    conn = util.mysql(settings.CONFIG_DB)
-    return conn
+    for i in range(3):
+        try:
+            conn = util.mysql(settings.CONFIG_DB)
+            return conn
+        except Exception as e:
+            logging.warning('连接configdb报错：{}'.format(e))
+            time.sleep(1)
 
 
 def get_archive_config(conn):
@@ -82,14 +93,14 @@ def get_archive_config(conn):
 
 def get_archive_tasks(conn):
     "获取归档任务"
-    sql = "select * from archive_tasks where exec_status in ('initial','waiting timeout') order by priority desc"
-    res = conn.query(sql)
+    sql = "select * from archive_tasks where exec_status in ('initial','waiting timeout') and sys_ctime>=curdate() order by priority desc"
+    res = conn.query(expr_to_date(sql))
     return res
 
 
 def get_failed_tasks():
     "获取当天运行失败的作业"
-    sql = "select id,exec_status from archive_tasks where sys_utime>={{TODAY}} and exec_status<>'done & ok'"
+    sql = "select id,exec_status from archive_tasks where sys_ctime>=curdate() and exec_status<>'done & ok'"
     conn = get_configdb_conn()
     res = conn.query(expr_to_date(sql))
     conn.close()
@@ -97,20 +108,20 @@ def get_failed_tasks():
 
 
 def send_exec_result():
-    "发送执行结果"
+    "发送执行报告"
     rows = []
     res = None
     try:
         res = get_failed_tasks()
+        title = '{}执行报告'.format(settings.NAME)
         if len(res) > 0:
-            title = '有{}个归档任务执行失败'.format(len(res))
+            text = '有{}个任务执行失败:\n'.format(len(res))
             for i in res:
                 row = "task_id: {} , exec_status: {}".format(i['id'], i['exec_status'])
                 rows.append(row)
-            text = "\n".join(rows)
+            text += "\n".join(rows)
         else:
-            title = '所有归档任务执行成功'
-            text = "\n"
+            text = '所有任务执行成功'
         send_msg_to_wxwork(title, text)
     except Exception:
         logging.error(res, exc_info=True)
@@ -126,10 +137,11 @@ def is_during_time_window(time_window_str):
             start_time_num = int(start_time.replace(':', ''))
             end_time_num = int(end_time.replace(':', ''))
             if start_time_num <= now_num and now_num <= end_time_num:
-                return True
+                return 1
+            else:
+                return 0
     except Exception:
-        logging.error("time_window格式错误:".format(time_window_str))
-    return False
+        return -1  # "time_window格式错误"
 
 
 class ArchiveConfig:
@@ -148,6 +160,7 @@ class ArchiveConfig:
         self.dest_table = conf['dest_table']
         self.archive_mode = conf['archive_mode']
         self.charset = conf['charset']
+        self.interval_day = conf['interval_day']
         self.archive_condition = conf['archive_condition']
         self.exec_time_window = conf['exec_time_window']
         self.priority = conf['priority']
@@ -156,6 +169,18 @@ class ArchiveConfig:
 
     def __str__(self):
         return str(self.__dict__)
+
+    def is_need_run(self, conn):
+        "判断是否符合满足interval天数"
+        sql = "select count(*) cnt from archive_tasks where config_id={} and exec_status in ('done & ok','running') and exec_start>=date_add(curdate(),interval {} day)".format(
+            self.id, 1 - self.interval_day)
+        res = conn.query(sql)
+        cnt = res[0]['cnt']
+        if cnt == 0:
+            return True
+        else:
+            logging.info("不满足间隔天数:[ id:{},interval_day:{} ]".format(self.id, self.interval_day))
+            return False
 
     def generate_cmds(self):
         "生成归档命令"
@@ -172,17 +197,27 @@ class ArchiveConfig:
         if self.archive_mode == 'archive':
             cmd = 'pt-archiver {} {} --progress=10000 --statistics --bulk-insert --limit=1000 --bulk-delete --commit-each --charset=utf8 --check-charset'.format(
                 subcmd1, subcmd2)
-            archive_cmd = '{} --where "{}"'.format(cmd, self.archive_condition)
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
+            self.archive_cmd_list.append(archive_cmd)
+        elif self.archive_mode == 'archive-no-ascend':
+            cmd = 'pt-archiver {} {} --progress=10000 --statistics --bulk-insert --limit=1000 --bulk-delete --commit-each --charset=utf8 --check-charset --no-ascend'.format(
+                subcmd1, subcmd2)
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
             self.archive_cmd_list.append(archive_cmd)
         elif self.archive_mode == 'archive-slow':
             cmd = 'pt-archiver {} {} --progress=10000 --statistics --bulk-delete --commit-each --limit=1000 --charset=utf8 --check-charset'.format(
                 subcmd1, subcmd2)
-            archive_cmd = '{} --where "{}"'.format(cmd, self.archive_condition)
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
+            self.archive_cmd_list.append(archive_cmd)
+        elif self.archive_mode == 'archive-slow-replace':
+            cmd = 'pt-archiver {} {} --progress=10000 --statistics --replace --bulk-delete --commit-each --limit=1000 --charset=utf8 --check-charset'.format(
+                subcmd1, subcmd2)
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
             self.archive_cmd_list.append(archive_cmd)
         elif self.archive_mode == 'delete':
             cmd = 'pt-archiver {} --progress=10000 --statistics --txn-size=1000 --purge --bulk-delete --limit=1000 --charset=utf8 --check-charset'.format(
                 subcmd1)
-            archive_cmd = '{} --where "{}"'.format(cmd, self.archive_condition)
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
             self.archive_cmd_list.append(archive_cmd)
         elif self.archive_mode == 'archive-to-file':
             dirname = "archive_data/{}_{}/{}.{}".format(self.source_host, self.source_port, self.source_db,
@@ -192,7 +227,28 @@ class ArchiveConfig:
                 os.makedirs(dirname)
             cmd = 'pt-archiver {} --progress=10000 --statistics --txn-size=1000 --file={} --bulk-delete --limit=1000 --charset=utf8 --check-charset'.format(
                 subcmd1, filename)
-            archive_cmd = '{} --where "{}"'.format(cmd, self.archive_condition)
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
+            self.archive_cmd_list.append(archive_cmd)
+        elif self.archive_mode == 'archive-partition':
+            cmd = 'python3 archive_partition_table.py -S {}:{} -T {}:{} -d {}:{} -t {}:{} -c {}'.format(
+                self.source_host, self.source_port, self.dest_host, self.dest_port, self.source_db, self.dest_db,
+                self.source_table, self.dest_table, self.charset)
+            cmd += " -m copy"
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
+            self.archive_cmd_list.append(archive_cmd)
+        elif self.archive_mode == 'archive-partition-slow-copy':
+            cmd = 'python3 archive_partition_table.py -S {}:{} -T {}:{} -d {}:{} -t {}:{} -c {}'.format(
+                self.source_host, self.source_port, self.dest_host, self.dest_port, self.source_db, self.dest_db,
+                self.source_table, self.dest_table, self.charset)
+            cmd += " -m slow-copy"
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
+            self.archive_cmd_list.append(archive_cmd)
+        elif self.archive_mode == 'archive-partition-slow-replace':
+            cmd = 'python3 archive_partition_table.py -S {}:{} -T {}:{} -d {}:{} -t {}:{} -c {}'.format(
+                self.source_host, self.source_port, self.dest_host, self.dest_port, self.source_db, self.dest_db,
+                self.source_table, self.dest_table, self.charset)
+            cmd += " -m slow-replace"
+            archive_cmd = '{} --where="{}"'.format(cmd, self.archive_condition)
             self.archive_cmd_list.append(archive_cmd)
         else:
             logging.error("archive_mode参数错误：[ id:{},archive_mode:{} ]".format(self.id, self.archive_mode))
@@ -200,12 +256,12 @@ class ArchiveConfig:
     def save_tasks(self, conn):
         "保存任务"
         table_name = 'archive_tasks'
-        fieldname_list = ['source_host', 'source_port', 'source_db', 'source_table', 'dest_host',
+        fieldname_list = ['config_id', 'source_host', 'source_port', 'source_db', 'source_table', 'dest_host',
                           'dest_port', 'dest_db', 'dest_table', 'archive_mode', 'exec_time_window', 'priority',
                           'exec_status', 'archive_cmd']
         rows = []
         for cmd in self.archive_cmd_list:
-            row = [self.source_host, self.source_port, self.source_db, self.source_table,
+            row = [self.id, self.source_host, self.source_port, self.source_db, self.source_table,
                    self.dest_host, self.dest_port, self.dest_db, self.dest_table, self.archive_mode,
                    self.exec_time_window, self.priority,
                    self.exec_status, cmd]
@@ -214,8 +270,9 @@ class ArchiveConfig:
 
     def start(self, conn):
         "生成任务"
-        self.generate_cmds()
-        self.save_tasks(conn)
+        if self.is_need_run(conn):
+            self.generate_cmds()
+            self.save_tasks(conn)
 
 
 class ArchiveTask:
@@ -278,9 +335,15 @@ class ArchiveTask:
         retcode = 0
 
         # 检查执行时间窗口
-        if not is_during_time_window(self.exec_time_window):
+        check_code = is_during_time_window(self.exec_time_window)
+        if check_code == 0:
             self.exec_status = "waiting timeout"
-            self.exec_log = "线程繁忙，等待超时。（无需处理，下一个时间窗口会自动调起）"
+            self.exec_log = "程序并发设置过低，等待超时。"
+            return retcode
+        elif check_code < 0:
+            self.exec_status = "check failed"
+            self.exec_log = "time_window格式错误:{}".format(self.exec_time_window)
+            logging.error("time_window格式错误:{}".format(self.exec_time_window))
             return retcode
 
         # 检查归档库和表是否存在或列是否一致
@@ -344,15 +407,15 @@ class ArchiveTask:
 def generate_tasks():
     "生成归档任务"
     conf_list = None
-    try:
-        conn = get_configdb_conn()
-        conf_list = get_archive_config(conn)
-        for conf in conf_list:
+    conn = get_configdb_conn()
+    conf_list = get_archive_config(conn)
+    for conf in conf_list:
+        try:
             o = ArchiveConfig(conf)
             o.start(conn)
-        conn.close()
-    except Exception:
-        logging.error(conf_list, exc_info=True)
+        except Exception:
+            logging.error(conf, exc_info=True)
+    conn.close()
 
 
 def generate_task_job():
@@ -365,7 +428,10 @@ def generate_task_job():
         now_time = time.strftime('%H:%M', time.localtime())
         if now_time == "00:00":  # 每天0:00执行
             logging.info('生成归档任务')
-            generate_tasks()
+            try:
+                generate_tasks()
+            except Exception:
+                logging.error(exc_info=True)
         elif now_time == "08:00" and hasattr(settings, 'WXWORK_WEBHOOK'):
             logging.info('发送归档报告')
             send_exec_result()
@@ -387,8 +453,8 @@ def produce_job():
         try:
             conn = get_configdb_conn()
             task_list = get_archive_tasks(conn)
-            # 过滤在执行时间窗口的
-            to_exec_task_list = [i for i in task_list if is_during_time_window(i['exec_time_window'])]
+            # 过滤不在执行时间窗口的
+            to_exec_task_list = [i for i in task_list if is_during_time_window(i['exec_time_window']) == 1]
             logging.info('有{}个任务推送到执行队列'.format(len(to_exec_task_list)))
             for task_conf in to_exec_task_list:
                 sql = "update archive_tasks set exec_status='waiting' where id={0}".format(task_conf['id'])
